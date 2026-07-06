@@ -7,7 +7,8 @@ load .pkl koin tsb dan menjalankan engine analisa yang sama persis dengan V5.
 """
 from __future__ import annotations
 
-from datetime import date
+import json
+from datetime import date, datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -36,6 +37,30 @@ CONTINUATION_ORDER = [
 ]
 MOMENTUM_EMOJI = {"lime": "🟢", "green": "🟩", "red": "🟥", "maroon": "🟫"}
 SQUEEZE_EMOJI = {"Squeeze ON (black)": "⬛", "Squeeze OFF (gray)": "⬜"}
+
+# Sama persis dgn fib_dataset_export.FIBSPEC: Up_X = max(O,C)+(X-1)*body ; Down_X = min(O,C)-(X-1)*body
+FIBSPEC = [("1.61", 0.61), ("2.5", 1.5), ("3.6", 2.6)]
+
+
+def fib_price_levels(o, c):
+    if o is None or c is None:
+        return None
+    bt, bb = max(float(o), float(c)), min(float(o), float(c))
+    body = bt - bb
+    if body <= 0:
+        return None
+    levels = {}
+    for tag, mu in FIBSPEC:
+        levels[f"{tag}_UP"] = bt + mu * body
+        levels[f"{tag}_DOWN"] = bb - mu * body
+    return {"body_top": bt, "body_bottom": bb, "body": body, "levels": levels}
+
+
+def _fmt_px(v):
+    if v is None:
+        return "—"
+    d = 2 if v >= 1000 else 3 if v >= 100 else 4 if v >= 1 else 6
+    return f"{v:,.{d}f}"
 
 
 # ============================ CACHING ============================
@@ -137,30 +162,66 @@ tab_analisa, tab_perf, tab_about = st.tabs(["🎯 Analisa Setup", "📈 Performa
 
 # ============================ TAB 1: ANALISA ============================
 with tab_analisa:
+    now_utc = datetime.now(timezone.utc)
     with st.form("input_form"):
         c1, c2, c3, c4 = st.columns([2, 2, 2, 1.6])
         with c1:
             st.text_input("Ticker", value=meta["ticker"], disabled=True,
                           help="Otomatis dari koin terpilih. Data di-fetch dari Binance.")
         with c2:
-            date_val = st.date_input("Tanggal (UTC)", value=date.today())
+            date_val = st.date_input("Tanggal (UTC)", value=now_utc.date(), max_value=now_utc.date())
         with c3:
-            hour_val = st.slider("Jam (UTC)", 0, 23, 0)
+            hour_val = st.slider("Jam (UTC)", 0, 23, now_utc.hour)
         with c4:
             trend_val = st.radio("Trend", ["Long", "Short"], horizontal=True)
+        st.caption(f"🕐 Sekarang **{now_utc:%Y-%m-%d %H:%M} UTC** (WIB = UTC+7). "
+                   f"Pilih jam ≤ {now_utc.hour:02d}:00 untuk hari ini.")
         submitted = st.form_submit_button("🔮 Jalankan Prediksi", use_container_width=True, type="primary")
 
     if submitted:
+        target_dt = datetime(date_val.year, date_val.month, date_val.day,
+                             int(hour_val), tzinfo=timezone.utc)
+        if target_dt > datetime.now(timezone.utc):
+            st.error(f"⏳ {date_val} {hour_val:02d}:00 UTC **masih di masa depan** — sekarang baru "
+                     f"{datetime.now(timezone.utc):%H:%M} UTC ({date_val} {hour_val:02d}:00 UTC = "
+                     f"jam {(int(hour_val) + 7) % 24:02d}:00 WIB). Pilih jam yang sudah lewat.")
+            st.stop()
         with st.spinner(f"📡 Fetch setup {coin} dari Binance..."):
             setup_auto = fetch_setup(meta["ticker"], date_val, hour_val)
         if setup_auto.get("error"):
             st.error(f"⚠️ Auto-fetch gagal: {setup_auto['error']}")
             st.stop()
+        setup_data = {
+            "Trend": trend_val,
+            "SQZMOM 1 Momentum": setup_auto["SQZMOM 1 Momentum"],
+            "SQZMOM 1 Squeeze": setup_auto["SQZMOM 1 Squeeze"],
+            "SQZMOM 1 Value": setup_auto["SQZMOM 1 Value"],
+            "SQZMOM 2 Momentum": setup_auto["SQZMOM 2 Momentum"],
+            "SQZMOM 2 Squeeze": setup_auto["SQZMOM 2 Squeeze"],
+            "SQZMOM 2 Value": setup_auto["SQZMOM 2 Value"],
+            "Bar 1": setup_auto["Bar 1"], "Bar 2": setup_auto["Bar 2"],
+            "Raw Position": setup_auto["Raw Position"],
+            "Final Position": setup_auto["Final Position"],
+            "Score": setup_auto["Score"], "Last TR": setup_auto["Last TR"],
+        }
+        with st.spinner("🧠 Menganalisis pola historis..."):
+            result = engine.predict(setup_data, top_k_matches=5)
+        # Simpan ke session_state supaya hasil TETAP tampil saat tombol download
+        # di-klik (download memicu rerun, submitted kembali False).
+        st.session_state["last_run"] = {
+            "coin": coin, "date": str(date_val), "hour": int(hour_val),
+            "trend": trend_val, "setup_auto": setup_auto, "result": result,
+        }
+
+    _last = st.session_state.get("last_run")
+    if _last and _last.get("coin") == coin:
+        setup_auto = _last["setup_auto"]
+        result = _last["result"]
+        run_date, run_hour, run_trend = _last["date"], _last["hour"], _last["trend"]
 
         close_val = setup_auto.get("_close")
         st.divider()
-        head = f"🤖 Setup {coin} di {date_val} jam {hour_val:02d}:00 UTC"
-        st.subheader(head)
+        st.subheader(f"🤖 Setup {coin} di {run_date} jam {run_hour:02d}:00 UTC")
         if close_val is not None:
             st.caption(f"Close price: **{close_val:,.4f}**")
 
@@ -198,27 +259,19 @@ with tab_analisa:
             d3.metric("MACD", f"{setup_auto.get('macd_last') or 0:.4f}")
             d4.metric("Filter", setup_auto.get("filter_reason", "-"))
 
-        setup_data = {
-            "Trend": trend_val,
-            "SQZMOM 1 Momentum": setup_auto["SQZMOM 1 Momentum"],
-            "SQZMOM 1 Squeeze": setup_auto["SQZMOM 1 Squeeze"],
-            "SQZMOM 1 Value": setup_auto["SQZMOM 1 Value"],
-            "SQZMOM 2 Momentum": setup_auto["SQZMOM 2 Momentum"],
-            "SQZMOM 2 Squeeze": setup_auto["SQZMOM 2 Squeeze"],
-            "SQZMOM 2 Value": setup_auto["SQZMOM 2 Value"],
-            "Bar 1": setup_auto["Bar 1"], "Bar 2": setup_auto["Bar 2"],
-            "Raw Position": setup_auto["Raw Position"],
-            "Final Position": setup_auto["Final Position"],
-            "Score": setup_auto["Score"], "Last TR": setup_auto["Last TR"],
-        }
-        with st.spinner("🧠 Menganalisis pola historis..."):
-            result = engine.predict(setup_data, top_k_matches=5)
-
         st.divider()
         st.header("📊 Hasil Prediksi")
+
+        fib = fib_price_levels(setup_auto.get("_open"), setup_auto.get("_close"))
+        fib_px = fib["levels"] if fib else {}
+
+        def _with_px(target):
+            px = fib_px.get(target)
+            return f"{target} @ {_fmt_px(px)}" if px is not None else (target or "-")
+
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("1️⃣ First-hit utama", result.first_hit_top_target or "-", f"{result.first_hit_top_prob:.1%}")
-        m2.metric("2️⃣ Kemungkinan kedua", result.first_hit_second_target or "-", f"{result.first_hit_second_prob:.1%}")
+        m1.metric("1️⃣ First-hit utama", _with_px(result.first_hit_top_target), f"{result.first_hit_top_prob:.1%}")
+        m2.metric("2️⃣ Kemungkinan kedua", _with_px(result.first_hit_second_target), f"{result.first_hit_second_prob:.1%}")
         m3.metric("⚠️ Risk Tie Same Bar", f"{result.tie_prob:.1%}")
         m4.metric("⌚ Risk No Hit 48h", f"{result.no_hit_prob:.1%}")
 
@@ -226,8 +279,60 @@ with tab_analisa:
         r1, r2 = st.columns(2)
         tr, trp = (reach_sorted[0] if reach_sorted else ("-", 0.0))
         sr, srp = (reach_sorted[1] if len(reach_sorted) > 1 else ("-", 0.0))
-        r1.metric("🎯 Reach paling mungkin", tr, f"{trp:.1%}")
-        r2.metric("🎯 Reach kedua", sr, f"{srp:.1%}")
+        r1.metric("🎯 Reach paling mungkin", _with_px(tr), f"{trp:.1%}")
+        r2.metric("🎯 Reach kedua", _with_px(sr), f"{srp:.1%}")
+
+        if fib:
+            close_px = setup_auto.get("_close")
+            ladder_rows = []
+            for t in ["3.6_UP", "2.5_UP", "1.61_UP"]:
+                ladder_rows.append({"Target": t, "Harga": _fmt_px(fib_px[t]),
+                                    "Jarak dari close": f"{(fib_px[t]-close_px)/close_px:+.2%}" if close_px else "—",
+                                    "Prob Reach": f"{result.reach_probs.get(t, 0):.1%}",
+                                    "Prob First-hit": f"{result.first_hit_probs.get(t, 0):.1%}"})
+            ladder_rows.append({"Target": "— close anchor —", "Harga": _fmt_px(close_px),
+                                "Jarak dari close": "0.00%", "Prob Reach": "", "Prob First-hit": ""})
+            for t in ["1.61_DOWN", "2.5_DOWN", "3.6_DOWN"]:
+                ladder_rows.append({"Target": t, "Harga": _fmt_px(fib_px[t]),
+                                    "Jarak dari close": f"{(fib_px[t]-close_px)/close_px:+.2%}" if close_px else "—",
+                                    "Prob Reach": f"{result.reach_probs.get(t, 0):.1%}",
+                                    "Prob First-hit": f"{result.first_hit_probs.get(t, 0):.1%}"})
+            st.markdown(f"##### 💰 Level Harga Fib · body anchor {_fmt_px(fib['body_bottom'])} – "
+                        f"{_fmt_px(fib['body_top'])} (body {_fmt_px(fib['body'])})")
+            st.dataframe(pd.DataFrame(ladder_rows), use_container_width=True, hide_index=True)
+
+            # --- Export untuk database ---
+            dt_utc = f"{run_date} {run_hour:02d}:00"
+            wide = {
+                "coin": coin, "datetime_utc": dt_utc, "trend": run_trend,
+                "anchor_open": setup_auto.get("_open"), "anchor_high": setup_auto.get("_high"),
+                "anchor_low": setup_auto.get("_low"), "anchor_close": close_px, "body": fib["body"],
+                "first_hit_top": result.first_hit_top_target,
+                "first_hit_top_prob": result.first_hit_top_prob,
+                "tie_prob": result.tie_prob, "no_hit_prob": result.no_hit_prob,
+            }
+            for t in ACTIONABLE_TARGETS:
+                col = t.replace(".", "").lower()  # 1.61_UP -> 161_up
+                wide[f"px_{col}"] = fib_px.get(t)
+                wide[f"reach_{col}"] = result.reach_probs.get(t)
+                wide[f"fh_{col}"] = result.first_hit_probs.get(t)
+            csv_str = pd.DataFrame([wide]).to_csv(index=False)
+            payload = {
+                "coin": coin, "datetime_utc": dt_utc, "trend": run_trend,
+                "anchor": {"open": setup_auto.get("_open"), "high": setup_auto.get("_high"),
+                           "low": setup_auto.get("_low"), "close": close_px, "body": fib["body"]},
+                "fib_prices": fib_px,
+                "reach_probs": result.reach_probs,
+                "first_hit_probs": result.first_hit_probs,
+                "continuation_probs": result.continuation_probs,
+            }
+            json_str = json.dumps(payload, indent=2, default=str)
+            fname = f"fibpath_{coin}_{run_date}_{run_hour:02d}00UTC"
+            e1, e2 = st.columns(2)
+            e1.download_button("⬇️ CSV (1 baris — siap database)", csv_str,
+                               f"{fname}.csv", "text/csv", use_container_width=True)
+            e2.download_button("⬇️ JSON (lengkap)", json_str,
+                               f"{fname}.json", "application/json", use_container_width=True)
 
         g1, g2 = st.columns(2)
         with g1:

@@ -141,6 +141,10 @@ def fetch_setup(
         # Untuk informasi/debug
         "_target_dt": str(target_dt_utc),
         "_close": _opt_float(cur, "Close"),
+        # OHLC bar anchor — dipakai untuk menghitung HARGA level fib
+        "_open": _opt_float(cur, "Open"),
+        "_high": _opt_float(cur, "High"),
+        "_low": _opt_float(cur, "Low"),
     }
 
     required = ("Bar 1", "Bar 2", "SQZMOM 1 Value", "SQZMOM 2 Value",
