@@ -34,7 +34,7 @@ def model_path(coin: str) -> Path:
 
 
 def dataset_path(coin: str) -> Path:
-    return coin_dir(coin) / f"Dataset Output Otomatis {coin} 2025-2026.xlsx"
+    return coin_dir(coin) / f"Dataset Output Otomatis {coin} 2024-2026.xlsx"
 
 
 def predictions_path(coin: str) -> Path:

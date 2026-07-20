@@ -24,7 +24,7 @@ from coin_registry import COINS, coin_dir, dataset_path, model_path
 from fib_pattern_engine_v5 import train_and_save_model_v5
 
 BASE = Path(__file__).resolve().parent
-START_MONTH = "2025-01"
+START_MONTH = "2024-07"
 
 
 def regen(coin: str) -> None:
