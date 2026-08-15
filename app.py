@@ -64,18 +64,37 @@ def _fmt_px(v):
 
 
 # ============================ CACHING ============================
-@st.cache_resource(show_spinner=False)
-def load_engine(coin: str) -> FibPatternEngineV5:
+# Cache di-key oleh sidik jari file, bukan cuma nama koin. Tanpa ini app yang
+# sedang berjalan tetap menyajikan angka lama setelah regenerate.py/backtest_v5.py
+# menimpa .pkl dan .csv-nya.
+def _stamp(path) -> tuple[int, int]:
+    try:
+        s = path.stat()
+        return (s.st_mtime_ns, s.st_size)
+    except OSError:
+        return (0, 0)
+
+
+@st.cache_resource(show_spinner=False, max_entries=len(COINS))
+def _load_engine(coin: str, stamp: tuple) -> FibPatternEngineV5:
     return FibPatternEngineV5.load(model_path(coin))
 
 
+def load_engine(coin: str) -> FibPatternEngineV5:
+    return _load_engine(coin, _stamp(model_path(coin)))
+
+
 @st.cache_data(show_spinner=False)
-def perf(coin: str):
+def _perf(coin: str, stamp: tuple):
     return compute_perf(predictions_path(coin))
 
 
+def perf(coin: str):
+    return _perf(coin, _stamp(predictions_path(coin)))
+
+
 @st.cache_data(show_spinner=False)
-def all_perf_table() -> pd.DataFrame:
+def _all_perf_table(stamps: tuple) -> pd.DataFrame:
     rows = []
     for c in available_coins():
         p = perf(c)
@@ -89,6 +108,10 @@ def all_perf_table() -> pd.DataFrame:
         })
     df = pd.DataFrame(rows).sort_values("Arah", ascending=False).reset_index(drop=True)
     return df
+
+
+def all_perf_table() -> pd.DataFrame:
+    return _all_perf_table(tuple(_stamp(predictions_path(c)) for c in available_coins()))
 
 
 def inject_css(accent: str) -> None:
@@ -138,6 +161,7 @@ with st.sidebar:
         st.metric("🎯 Akurasi arah (OOS)", f"{p['dir_acc']:.1%}",
                   f"{p['edge']:+.1%} vs base-rate")
         st.caption(f"Konsisten **{p['months_win']}/{p['months_total']}** bulan · z={p['z']:.1f}")
+        st.caption(f"Data s/d **{p['date_max']:%d %b %Y}**")
 
     ds = dataset_path(coin)
     st.markdown("---")
