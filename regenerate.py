@@ -16,6 +16,7 @@ taruh backtest_v5_predictions.csv di models/<COIN>/.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import subprocess
 import sys
 from pathlib import Path
@@ -24,7 +25,9 @@ from coin_registry import COINS, coin_dir, dataset_path, model_path
 from fib_pattern_engine_v5 import train_and_save_model_v5
 
 BASE = Path(__file__).resolve().parent
-START_MONTH = "2024-07"
+# Jendela latih: 2 tahun terakhir dihitung dari saat run (rolling, bukan patokan tetap).
+_NOW = datetime.now(timezone.utc)
+START_MONTH = f"{_NOW.year - 2}-{_NOW.month:02d}"
 
 
 def regen(coin: str) -> None:

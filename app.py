@@ -7,8 +7,9 @@ load .pkl koin tsb dan menjalankan engine analisa yang sama persis dengan V5.
 """
 from __future__ import annotations
 
+import html
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -114,6 +115,139 @@ def all_perf_table() -> pd.DataFrame:
     return _all_perf_table(tuple(_stamp(predictions_path(c)) for c in available_coins()))
 
 
+# ============================ KESEGARAN MODEL ============================
+# "Kapan terakhir di-update" dibaca dari mtime file, bukan disimpan manual — jadi
+# otomatis benar setiap regenerate.py / backtest_v5.py menimpa file-nya.
+# Semua jam di panel ini ditampilkan dalam WIB (UTC+7) — zona acuan app (caption form
+# "WIB = UTC+7") — bukan zona jam mesin, supaya jam model vs jam data langsung sebanding.
+# (Jam mesin ini UTC+8, jadi angka di Explorer terlihat 1 jam lebih besar — itu wajar.)
+WIB = timezone(timedelta(hours=7))
+TZ_LABEL = "WIB"
+# Status kesegaran: glyph + kata, bukan warna saja.
+_ST = {"good": ("✓", ""), "warning": ("▲", " · mulai usang"),
+       "serious": ("✕", " · usang"), "muted": ("–", "")}
+_MONTHS_ID_INV = {"Januari": 1, "Februari": 2, "Maret": 3, "April": 4, "Mei": 5, "Juni": 6,
+                  "Juli": 7, "Agustus": 8, "September": 9, "Oktober": 10, "November": 11,
+                  "Desember": 12}
+
+
+def _mtime_local(path):
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=WIB)
+    except OSError:
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def _dataset_last_bar(coin: str, stamp: tuple):
+    """Bar 1h terakhir di sheet terakhir dataset (UTC). Sheet = 1 bulan, urut kronologis."""
+    try:
+        df = pd.read_excel(dataset_path(coin), sheet_name=-1, usecols=["Date", "Clock"])
+        d, mon, y = str(df["Date"].iloc[-1]).split()
+        return datetime(int(y), _MONTHS_ID_INV[mon], int(d), int(df["Clock"].iloc[-1]),
+                        tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def freshness(coin: str) -> dict:
+    return {
+        "model": _mtime_local(model_path(coin)),
+        "backtest": _mtime_local(predictions_path(coin)),
+        "dataset": _mtime_local(dataset_path(coin)),
+        "last_bar": _dataset_last_bar(coin, _stamp(dataset_path(coin))),
+    }
+
+
+def _age(dt) -> tuple[str, str]:
+    """('hari ini' | 'kemarin' | 'N hari lalu', status good|warning|serious|muted)."""
+    if dt is None:
+        return "—", "muted"
+    days = (datetime.now(WIB).date() - dt.astimezone(WIB).date()).days
+    txt = "hari ini" if days == 0 else "kemarin" if days == 1 else f"{days} hari lalu"
+    return txt, ("good" if days <= 3 else "warning" if days <= 10 else "serious")
+
+
+def _fmt_dt(dt, tz_label: str = TZ_LABEL) -> str:
+    return f"{dt.astimezone(WIB):%d %b %Y %H:%M} {tz_label}" if dt else "—"
+
+
+def render_freshness(fr: dict) -> str:
+    """Panel kecil 3 baris: model · backtest · data. Warna status selalu ditemani teks."""
+    rows = []
+    for icon, lbl, dt in (("🧠", "Model diperbarui", fr["model"]),
+                          ("🧪", "Backtest dijalankan", fr["backtest"]),
+                          ("📡", "Data Binance s/d", fr["last_bar"])):
+        age, status = _age(dt)
+        glyph, word = _ST[status]
+        rows.append(f"<div class='fr-row'><span class='fr-ic'>{icon}</span>"
+                    f"<span class='fr-lbl'>{lbl}</span>"
+                    f"<span class='fr-val'>{_fmt_dt(dt)}</span>"
+                    f"<span class='fr-age st-{status}'><i>{glyph}</i>{age}{word}</span></div>")
+    return ("<div class='fresh'><div class='fr-title'>🕒 Pembaruan terakhir · WIB (UTC+7)</div>"
+            + "".join(rows) + "</div>")
+
+
+# ============================ LADDER LEVEL FIB ============================
+UP_TARGETS = ["3.6_UP", "2.5_UP", "1.61_UP"]
+DOWN_TARGETS = ["1.61_DOWN", "2.5_DOWN", "3.6_DOWN"]
+
+
+def render_fib_ladder(fib: dict, fib_px: dict, close_px, reach: dict, first_hit: dict) -> str:
+    """Tabel level Fib sebagai HTML: Prob Reach = meter per baris (kolom utama).
+
+    Warna bar = arah (UP biru / DOWN merah, anchor abu-abu netral); angka tetap
+    warna teks. Baris reach tertinggi ditandai ikon + ring, bukan warna saja.
+    Dibangun satu baris tanpa indentasi supaya markdown Streamlit tidak
+    menganggapnya code block.
+    """
+    tg = UP_TARGETS + DOWN_TARGETS
+    r = {t: float(reach.get(t, 0) or 0) for t in tg}
+    fh = {t: float(first_hit.get(t, 0) or 0) for t in tg}
+    r_max, fh_max = max(r.values()), max(fh.values())
+    # Tandai "tertinggi" hanya bila unik: reach sering seri di 100% untuk beberapa level
+    # sekaligus, dan ring/chip di separuh tabel tidak menuntun mata ke mana pun.
+    eps = 1e-9
+    r_tops = [t for t in tg if abs(r[t] - r_max) < eps]
+    fh_tops = [t for t in tg if abs(fh[t] - fh_max) < eps]
+    r_top = r_tops[0] if (len(r_tops) == 1 and r_max > 0) else None
+    fh_top_t = fh_tops[0] if (len(fh_tops) == 1 and fh_max > 0) else None
+
+    def row(t):
+        side = "up" if t.endswith("_UP") else "down"
+        px = fib_px.get(t)
+        dist = f"{(px - close_px) / close_px:+.2%}" if (px is not None and close_px) else "—"
+        top = t == r_top
+        fh_top = t == fh_top_t
+        pct = max(0.0, min(1.0, r[t])) * 100
+        chip = "<span class='chip'>🎯 tertinggi</span>" if top else ""
+        fh_cls = "fh dim" if fh[t] == 0 else ("fh strong" if fh_top else "fh")
+        fh_chip = "<span class='chip chip-fh'>1st</span>" if fh_top else ""
+        return (f"<div class='lr {side}{' top' if top else ''}'>"
+                f"<div class='c tgt'><i class='dot'></i><span class='tl'>{html.escape(t)}</span>{chip}</div>"
+                f"<div class='c px'>{_fmt_px(px)}</div>"
+                f"<div class='c dist'>{dist}</div>"
+                f"<div class='c reach' title='Prob Reach {html.escape(t)}: {r[t]:.1%}'>"
+                f"<span class='rv'>{r[t]:.1%}</span>"
+                f"<span class='track'><span class='fill' style='width:{pct:.1f}%'></span></span></div>"
+                f"<div class='c {fh_cls}'>{fh[t]:.1%}{fh_chip}</div>"
+                f"</div>")
+
+    anchor = (f"<div class='lr anchor'><div class='c tgt'><i class='dot'></i><span class='tl'>close anchor</span></div>"
+              f"<div class='c px'>{_fmt_px(close_px)}</div><div class='c dist'>0.00%</div>"
+              f"<div class='c reach'><span class='mid'></span></div><div class='c fh dim'></div></div>")
+
+    head = ("<div class='lh'><div>Target</div><div>Harga</div><div>Jarak dari close</div>"
+            "<div>Prob Reach</div><div>Prob First-hit</div></div>")
+    title = (f"<div class='lt'><div><span class='lt-h'>💰 Level Harga Fib</span>"
+             f"<span class='lt-s'>body anchor {_fmt_px(fib['body_bottom'])} – {_fmt_px(fib['body_top'])}"
+             f" · body {_fmt_px(fib['body'])}</span></div>"
+             f"<div class='lg'><span class='lg-up'><i></i>UP</span><span class='lg-dn'><i></i>DOWN</span>"
+             f"<span class='lg-note'>bar = Prob Reach (0–100%)</span></div></div>")
+    body = "".join(row(t) for t in UP_TARGETS) + anchor + "".join(row(t) for t in DOWN_TARGETS)
+    return f"<div class='ladder'>{title}{head}{body}</div>"
+
+
 def inject_css(accent: str) -> None:
     st.markdown(f"""
     <style>
@@ -135,8 +269,100 @@ def inject_css(accent: str) -> None:
       .stTabs [data-baseweb="tab-list"] {{ gap: 4px; }}
       .stTabs [data-baseweb="tab"] {{ background:#161b26; border-radius:10px 10px 0 0; padding:8px 16px; }}
       .stTabs [aria-selected="true"] {{ background:{accent}26; border-bottom:2px solid {accent}; }}
+      .stApp {{ --accent:{accent}; --accent-border:{accent}55; }}
+      {LADDER_CSS}
     </style>
     """, unsafe_allow_html=True)
+
+
+# CSS ladder + panel kesegaran. Token warna: surface app #161b26 / #232a39; tinta
+# #eef2f8 / #aab3c5 / #6f7a90; seri UP #3987e5, DOWN #e66767 (pasangan divergen
+# biru↔merah, lolos cek CVD di surface gelap — hijau/merah tidak); status good
+# #0ca30c, warning #fab219, serious #ec835a.
+LADDER_CSS = """
+      .ladder { background:#161b26; border:1px solid var(--accent-border); border-radius:16px;
+                padding:14px 18px 10px; margin:4px 0 14px; box-shadow:0 6px 24px #0006;
+                font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+                container-type:inline-size; }
+      .ladder .lt { display:flex; justify-content:space-between; align-items:flex-end; gap:12px;
+                    flex-wrap:wrap; margin-bottom:10px; }
+      .ladder .lt-h { font-size:1.12rem; font-weight:700; color:#eef2f8; margin-right:10px; }
+      .ladder .lt-s { font-size:.84rem; color:#aab3c5; }
+      .ladder .lg { display:flex; gap:14px; align-items:center; font-size:.78rem; color:#aab3c5; }
+      .ladder .lg i { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px;
+                      vertical-align:-1px; }
+      .ladder .lg-up i { background:#3987e5; }  .ladder .lg-dn i { background:#e66767; }
+      .ladder .lg-note { color:#6f7a90; }
+      .ladder .lh, .ladder .lr { display:grid; align-items:center; gap:0 14px;
+        grid-template-columns:minmax(130px,1.4fr) minmax(100px,1.1fr) minmax(96px,1fr) minmax(200px,3fr) minmax(96px,1fr); }
+      .ladder .lh { font-size:.74rem; letter-spacing:.06em; text-transform:uppercase; color:#6f7a90;
+                    padding:6px 10px; border-bottom:1px solid #232a39; }
+      .ladder .lh div:nth-child(4) { color:#aab3c5; font-weight:700; }
+      .ladder .lr { padding:9px 10px; min-height:50px; border-radius:10px; border:1px solid transparent;
+                    transition:background .12s; font-variant-numeric:tabular-nums; }
+      .ladder .lr + .lr { margin-top:2px; }
+      .ladder .lr:hover { background:#ffffff08; }
+      .ladder .c { min-width:0; color:#eef2f8; font-size:.98rem; }
+      .ladder .tgt { font-weight:600; display:flex; align-items:center; gap:6px 8px; flex-wrap:wrap; }
+      .ladder .tl { white-space:nowrap; }
+      .ladder .dot { width:8px; height:8px; border-radius:50%; flex:0 0 8px; }
+      .ladder .up .dot { background:#3987e5; }  .ladder .down .dot { background:#e66767; }
+      .ladder .dist { color:#aab3c5; }
+      .ladder .reach { display:flex; align-items:center; gap:12px; }
+      .ladder .rv { font-size:1.3rem; font-weight:700; color:#eef2f8; flex:0 0 5.4rem; min-width:5.4rem;
+                    text-align:right; line-height:1; }
+      .ladder .track { flex:1 1 auto; height:10px; border-radius:0 4px 4px 0; overflow:hidden; background:#2a3140; }
+      .ladder .fill { display:block; height:100%; border-radius:0 4px 4px 0; }
+      .ladder .up .track { background:#3987e52e; }   .ladder .up .fill { background:#3987e5; }
+      .ladder .down .track { background:#e666672e; } .ladder .down .fill { background:#e66767; }
+      .ladder .fh { color:#aab3c5; }
+      .ladder .fh.strong { color:#eef2f8; font-weight:700; }
+      .ladder .fh.dim { color:#6f7a90; }
+      .ladder .chip { font-size:.7rem; font-weight:600; letter-spacing:.02em; color:#eef2f8;
+                      background:#ffffff14; border:1px solid #ffffff22; border-radius:999px;
+                      padding:2px 8px; white-space:nowrap; }
+      .ladder .chip-fh { margin-left:8px; color:#aab3c5; }
+      .ladder .top { background:#ffffff0a; border-color:#ffffff24; }
+      .ladder .top .rv { font-size:1.45rem; }
+      .ladder .anchor { background:#2a314066; margin:6px 0; min-height:38px; padding:5px 10px; }
+      .ladder .anchor .c { color:#aab3c5; font-size:.9rem; }
+      .ladder .anchor .tgt { font-weight:600; letter-spacing:.04em; text-transform:uppercase; font-size:.78rem; }
+      .ladder .anchor .dot { background:#6f7a90; }
+      .ladder .anchor .mid { flex:1; height:1px; background:#3a4356; }
+      /* Lebar sempit (sidebar terbuka di laptop kecil / jendela dibagi dua): tiap baris jadi
+         2 lajur — target·harga·jarak di atas, meter selebar kartu + first-hit di bawah. */
+      @container (max-width: 760px) {
+        .ladder .lh { display:none; }
+        .ladder .lr { grid-template-columns:minmax(0,1fr) auto 12rem; grid-template-areas:"tgt px dist" "reach reach fh";
+                      row-gap:8px; padding:10px 12px; }
+        .ladder .tgt { grid-area:tgt; } .ladder .px { grid-area:px; }
+        .ladder .dist { grid-area:dist; text-align:right; }
+        .ladder .reach { grid-area:reach; } .ladder .fh { grid-area:fh; text-align:right; white-space:nowrap; }
+        .ladder .fh::before { content:"first-hit "; color:#6f7a90; font-size:.72rem; letter-spacing:.05em;
+                              text-transform:uppercase; }
+        .ladder .anchor { grid-template-areas:"tgt px dist"; }
+        .ladder .anchor .reach, .ladder .anchor .fh { display:none; }
+      }
+      .fresh { background:#161b26; border:1px solid #232a39; border-radius:12px; padding:10px 12px; margin:6px 0 2px;
+               font-family:system-ui,-apple-system,"Segoe UI",sans-serif; }
+      .fresh .fr-title { font-size:.78rem; letter-spacing:.05em; text-transform:uppercase; color:#6f7a90;
+                         margin-bottom:6px; }
+      .fresh .fr-row { display:grid; grid-template-columns:18px 1fr; gap:0 6px; align-items:baseline;
+                       padding:3px 0; font-size:.82rem; }
+      .fresh .fr-ic { font-size:.8rem; }
+      .fresh .fr-lbl { color:#aab3c5; }
+      .fresh .fr-val { grid-column:2; color:#eef2f8; font-variant-numeric:tabular-nums; font-weight:600; }
+      .fresh .fr-age { grid-column:2; font-size:.76rem; color:#aab3c5; }
+      .fresh .fr-age i { font-style:normal; font-weight:700; margin-right:5px; color:#6f7a90; }
+      .fresh .st-good i { color:#0ca30c; }  .fresh .st-warning i { color:#fab219; }
+      .fresh .st-serious i { color:#ec835a; }
+      .hero-fresh { display:inline-flex; align-items:center; gap:6px; margin-left:10px; padding:2px 10px;
+                    border-radius:999px; background:#ffffff10; border:1px solid #ffffff1f; font-size:.8rem;
+                    color:#dfe6f2; }
+      .hero-fresh i { font-style:normal; font-weight:700; color:#6f7a90; }
+      .hero-fresh.st-good i { color:#0ca30c; } .hero-fresh.st-warning i { color:#fab219; }
+      .hero-fresh.st-serious i { color:#ec835a; }
+"""
 
 
 # ============================ SIDEBAR ============================
@@ -160,8 +386,11 @@ with st.sidebar:
     if p:
         st.metric("🎯 Akurasi arah (OOS)", f"{p['dir_acc']:.1%}",
                   f"{p['edge']:+.1%} vs base-rate")
-        st.caption(f"Konsisten **{p['months_win']}/{p['months_total']}** bulan · z={p['z']:.1f}")
-        st.caption(f"Data s/d **{p['date_max']:%d %b %Y}**")
+        st.caption(f"Konsisten **{p['months_win']}/{p['months_total']}** bulan · z={p['z']:.1f} "
+                   f"· prediksi s/d **{p['date_max']:%d %b %Y}**")
+
+    fresh = freshness(coin)
+    st.markdown(render_freshness(fresh), unsafe_allow_html=True)
 
     ds = dataset_path(coin)
     st.markdown("---")
@@ -174,10 +403,13 @@ with st.sidebar:
 inject_css(meta["accent"])
 engine = load_engine(coin)
 
+_age_txt, _age_st = _age(fresh["model"])
 st.markdown(f"""
 <div class="coin-hero">
   <h1>{meta['emoji']} {coin}/USD — {meta['name']}</h1>
-  <div class="sub">Fib Path Analyzer V5 · {meta['symbol']} · 1h Binance</div>
+  <div class="sub">Fib Path Analyzer V5 · {meta['symbol']} · 1h Binance
+    <span class="hero-fresh st-{_age_st}"><i>{_ST[_age_st][0]}</i>model diperbarui {_fmt_dt(fresh['model'])} · {_age_txt}{_ST[_age_st][1]}</span>
+  </div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -308,22 +540,8 @@ with tab_analisa:
 
         if fib:
             close_px = setup_auto.get("_close")
-            ladder_rows = []
-            for t in ["3.6_UP", "2.5_UP", "1.61_UP"]:
-                ladder_rows.append({"Target": t, "Harga": _fmt_px(fib_px[t]),
-                                    "Jarak dari close": f"{(fib_px[t]-close_px)/close_px:+.2%}" if close_px else "—",
-                                    "Prob Reach": f"{result.reach_probs.get(t, 0):.1%}",
-                                    "Prob First-hit": f"{result.first_hit_probs.get(t, 0):.1%}"})
-            ladder_rows.append({"Target": "— close anchor —", "Harga": _fmt_px(close_px),
-                                "Jarak dari close": "0.00%", "Prob Reach": "", "Prob First-hit": ""})
-            for t in ["1.61_DOWN", "2.5_DOWN", "3.6_DOWN"]:
-                ladder_rows.append({"Target": t, "Harga": _fmt_px(fib_px[t]),
-                                    "Jarak dari close": f"{(fib_px[t]-close_px)/close_px:+.2%}" if close_px else "—",
-                                    "Prob Reach": f"{result.reach_probs.get(t, 0):.1%}",
-                                    "Prob First-hit": f"{result.first_hit_probs.get(t, 0):.1%}"})
-            st.markdown(f"##### 💰 Level Harga Fib · body anchor {_fmt_px(fib['body_bottom'])} – "
-                        f"{_fmt_px(fib['body_top'])} (body {_fmt_px(fib['body'])})")
-            st.dataframe(pd.DataFrame(ladder_rows), use_container_width=True, hide_index=True)
+            st.markdown(render_fib_ladder(fib, fib_px, close_px, result.reach_probs,
+                                          result.first_hit_probs), unsafe_allow_html=True)
 
             # --- Export untuk database ---
             dt_utc = f"{run_date} {run_hour:02d}:00"
@@ -414,8 +632,11 @@ with tab_perf:
     if not p:
         st.warning("Belum ada backtest_v5_predictions.csv untuk koin ini.")
     else:
+        _bt = freshness(coin)["backtest"]
         st.markdown(f"#### {coin} · {p['n_total']:,} prediksi · "
                     f"{pd.to_datetime(p['date_min']):%b %Y}–{pd.to_datetime(p['date_max']):%b %Y}")
+        st.caption(f"🧪 Backtest terakhir dijalankan **{_fmt_dt(_bt, TZ_LABEL)}** "
+                   f"({_age(_bt)[0]}) · file `models/{coin}/backtest_v5_predictions.csv`")
         k1, k2, k3, k4, k5, k6 = st.columns(6)
         k1.metric("Akurasi arah", f"{p['dir_acc']:.1%}", f"{p['edge']:+.1%} vs base")
         k2.metric("Signifikansi z", f"{p['z']:.1f}")
